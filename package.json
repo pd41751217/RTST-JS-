@@ -1,0 +1,13 @@
+{
+  "name": "rtst-realtime-transcription",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "npm -w packages/backend run dev",
+    "start": "npm -w packages/backend start"
+  }
+}
+
