@@ -27,23 +27,22 @@ const clientWss = new WebSocketServer({ server, path: '/ws' });
 // Util: connect to OpenAI Realtime WS for transcription
 function connectRealtimeSession() {
   const model = process.env.OPENAI_REALTIME_MODEL || 'gpt-4o-transcribe';
-  /*const url = `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(model)}`;
-
+  const url = `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(model)}`;
   const openaiWs = new WebSocket(url, {
     headers: {
       Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
       'OpenAI-Beta': 'realtime=v1',
     },
-  });*/
+  });
 
-  const openaiWs = new WebSocket(
-    "wss://api.openai.com/v1/realtime?intent=transcription",
-    [
-      "realtime",
-      `openai-insecure-api-key.${process.env.OPENAI_API_KEY}`,
-      "openai-beta.realtime-v1",
-    ]
-  );
+  // const openaiWs = new WebSocket(
+  //   "wss://api.openai.com/v1/realtime?intent=transcription",
+  //   [
+  //     "realtime",
+  //     `openai-insecure-api-key.${process.env.OPENAI_API_KEY}`,
+  //     "openai-beta.realtime-v1",
+  //   ]
+  // );
 
   return openaiWs;
 }
@@ -70,40 +69,40 @@ clientWss.on('connection', (client) => {
     const vadSilenceDurationMs = Number(process.env.VAD_SILENCE_DURATION_MS || 500);
     const rate = Number(process.env.AUDIO_RATE || 24000);
 
-    // const sessionUpdate = {
-    //   type: 'session.update',
-    //   session: {
-    //     // Configure transcription-only behavior
-    //     model: transcriptionModel,
-    //     input_audio_format: 'pcm16',
-    //     input_audio_transcription: {
-    //       model: transcriptionModel,
-    //       language,
-    //       prompt: process.env.TRANSCRIPTION_PROMPT || ''
-    //     },
-    //     turn_detection: process.env.VAD_ENABLED === 'false' ? null : {
-    //       type: 'server_vad',
-    //       threshold: vadThreshold,
-    //       prefix_padding_ms: vadPrefixPaddingMs,
-    //       silence_duration_ms: vadSilenceDurationMs,
-    //     }
-    //   }
-    // };
-
     const sessionUpdate = {
-      type: "transcription_session.update",
+      type: 'session.update',
       session: {
+        // Configure transcription-only behavior
+        model: transcriptionModel,
+        input_audio_format: 'pcm16',
         input_audio_transcription: {
-          model: "gpt-4o-transcribe",
-          language: "en",
+          model: transcriptionModel,
+          language,
+          prompt: process.env.TRANSCRIPTION_PROMPT || ''
         },
-        input_audio_noise_reduction: { type: "near_field" },
-        turn_detection: {
-          type: "semantic_vad",
-          eagerness: "low",
-        },
-      },
+        turn_detection: process.env.VAD_ENABLED === 'false' ? null : {
+          type: 'server_vad',
+          threshold: vadThreshold,
+          prefix_padding_ms: vadPrefixPaddingMs,
+          silence_duration_ms: vadSilenceDurationMs,
+        }
+      }
     };
+
+    // const sessionUpdate = {
+    //   type: "transcription_session.update",
+    //   session: {
+    //     input_audio_transcription: {
+    //       model: "gpt-4o-transcribe",
+    //       language: "en",
+    //     },
+    //     input_audio_noise_reduction: { type: "near_field" },
+    //     turn_detection: {
+    //       type: "semantic_vad",
+    //       eagerness: "low",
+    //     },
+    //   },
+    // };
 
     safeSend(openai, JSON.stringify(sessionUpdate));
 
@@ -163,9 +162,19 @@ clientWss.on('connection', (client) => {
           if (!base64) return;
           const evt = { type: 'input_audio_buffer.append', audio: base64 };
           safeSend(openai, JSON.stringify(evt));
+          console.log(`Speaker audio chunk: ${chunk.length} bytes`);
         });
-        speakerProc.stderr.on('data', () => {});
-        speakerProc.on('close', () => { speakerProc = null; });
+        speakerProc.stderr.on('data', (data) => {
+          console.log('FFmpeg stderr:', data.toString());
+        });
+        speakerProc.on('close', (code) => { 
+          console.log(`FFmpeg process closed with code ${code}`);
+          speakerProc = null; 
+        });
+        speakerProc.on('error', (err) => {
+          console.error('FFmpeg process error:', err);
+          speakerProc = null;
+        });
         return;
       }
       if (maybe && typeof maybe === 'object' && maybe.type === 'speaker.capture.stop') {

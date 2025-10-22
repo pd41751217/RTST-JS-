@@ -121,6 +121,7 @@ async function startSpeaker() {
   sourceNode.connect(processorNode);
   processorNode.connect(audioContext.destination);
   speakerBtn.textContent = 'Stop Speaker';
+  setStatus('Speaker capture started (frontend)');
 }
 
 function stopSpeaker() {
@@ -168,6 +169,7 @@ function connect() {
   ws.addEventListener('message', (ev) => {
     try {
       const data = JSON.parse(typeof ev.data === 'string' ? ev.data : new TextDecoder().decode(ev.data));
+      console.log('Received event:', data.type, data);
       if (data.type === 'conversation.item.input_audio_transcription.delta') {
         appendLiveText(data.delta);
       } else if (data.type === 'conversation.item.input_audio_transcription.completed') {
@@ -192,14 +194,28 @@ micBtn.addEventListener('click', async () => {
 speakerBtn.addEventListener('click', async () => {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
   if (!speakerCapturing) {
-    // Backend-based capture: no screen share. Requires ffmpeg + loopback device on server.
-    ws.send(JSON.stringify({ type: 'speaker.capture.start' }));
-    speakerBtn.textContent = 'Stop Speaker';
-    speakerCapturing = true;
-    // Ensure mic is stopped on UI side
-    if (mediaStream) stopMic();
+    // Try frontend-based capture first (browser screen sharing with audio)
+    try {
+      await startSpeaker();
+      speakerCapturing = true;
+    } catch (error) {
+      console.log('Frontend speaker capture failed, trying backend method:', error);
+      // Fallback to backend-based capture: no screen share. Requires ffmpeg + loopback device on server.
+      ws.send(JSON.stringify({ type: 'speaker.capture.start' }));
+      speakerBtn.textContent = 'Stop Speaker';
+      speakerCapturing = true;
+      setStatus('Speaker capture started (backend)');
+      // Ensure mic is stopped on UI side
+      if (mediaStream) stopMic();
+    }
   } else {
-    ws.send(JSON.stringify({ type: 'speaker.capture.stop' }));
+    if (mediaStream) {
+      // Frontend capture is active
+      stopSpeaker();
+    } else {
+      // Backend capture is active
+      ws.send(JSON.stringify({ type: 'speaker.capture.stop' }));
+    }
     speakerBtn.textContent = 'Start Speaker';
     speakerCapturing = false;
   }
