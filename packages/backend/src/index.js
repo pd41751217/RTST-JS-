@@ -5,6 +5,8 @@ import cors from 'cors';
 import WebSocket, { WebSocketServer } from 'ws';
 import { mountFrontend } from './static.js';
 import { spawn } from 'child_process';
+import opusPkg from '@discordjs/opus';
+const { OpusEncoder } = opusPkg;
 
 const PORT = process.env.PORT || 3001;
 
@@ -59,6 +61,17 @@ clientWss.on('connection', (client) => {
 
   const pendingClientMessages = [];
   let speakerProc = null;
+  
+  // Initialize Opus encoder and decoder (@discordjs/opus)
+  const sampleRate = Number(process.env.AUDIO_RATE || 24000);
+  const channels = 1; // mono
+  const encoder = new OpusEncoder(sampleRate, channels);
+  const decoder = new OpusEncoder(sampleRate, channels);
+  
+  // Audio buffers for opus frame processing (valid opus frame sizes for 24kHz: 60, 120, 240, 480, 960, 1440)
+  const opusFrameSize = 960; // 40ms at 24kHz - common real-time frame size
+  let audioBuffer = new Int16Array(0); // for client audio
+  let speakerAudioBuffer = new Int16Array(0); // for speaker capture audio
 
   openai.on('open', () => {
     // Configure session for transcription mode + VAD, language, etc
@@ -120,16 +133,101 @@ clientWss.on('connection', (client) => {
       if (!buf || buf.length === 0) return;
       // ensure 16-bit alignment
       if (buf.length % 2 !== 0) return;
-      // Wrap audio chunk into input_audio_buffer.append event
-      const base64 = buf.toString('base64');
-      if (base64.length === 0) return;
-      const evt = {
-        type: 'input_audio_buffer.append',
-        audio: base64,
-      };
-      const msg = JSON.stringify(evt);
-      if (openai.readyState === WebSocket.OPEN) safeSend(openai, msg);
-      else pendingClientMessages.push(msg);
+      
+      // Option to bypass opus for testing (set OPUS_ENABLED=false in env)
+      const useOpus = process.env.OPUS_ENABLED !== 'false';
+      
+      if (!useOpus) {
+        // Direct path: send original buffer without opus processing
+        const base64 = buf.toString('base64');
+        if (base64.length === 0) return;
+        const evt = {
+          type: 'input_audio_buffer.append',
+          audio: base64,
+        };
+        const msg = JSON.stringify(evt);
+        if (openai.readyState === WebSocket.OPEN) safeSend(openai, msg);
+        else pendingClientMessages.push(msg);
+        return;
+      }
+      
+      try {
+        // Convert buffer to Int16Array
+        const samples = buf.length / 2;
+        const pcm16Data = new Int16Array(samples);
+        for (let i = 0; i < samples; i++) {
+          pcm16Data[i] = buf.readInt16LE(i * 2);
+        }
+        
+        // Append to audio buffer
+        const newBuffer = new Int16Array(audioBuffer.length + samples);
+        newBuffer.set(audioBuffer);
+        newBuffer.set(pcm16Data, audioBuffer.length);
+        audioBuffer = newBuffer;
+
+        console.log('Audio buffer:', audioBuffer.length, 'samples');
+        
+        // Process complete opus frames
+        while (audioBuffer.length >= opusFrameSize) {
+          // Extract one frame
+          const frame = audioBuffer.slice(0, opusFrameSize);
+          audioBuffer = audioBuffer.slice(opusFrameSize);
+          
+          // Encode with opus (@discordjs/opus expects PCM16 Buffer)
+          const framePcmBuffer = Buffer.allocUnsafe(opusFrameSize * 2);
+          for (let i = 0; i < opusFrameSize; i++) {
+            framePcmBuffer.writeInt16LE(frame[i], i * 2);
+          }
+          const encoded = encoder.encode(framePcmBuffer);
+          
+          // Decode back to PCM16 (Buffer)
+          const decodedBuffer = decoder.decode(encoded);
+          const decodedBytes = decodedBuffer.length;
+          const decodedSamples = decodedBytes / 2; // bytes to samples (mono)
+          console.log(`Frame: ${opusFrameSize} samples -> Encoded: ${encoded.length} bytes -> Decoded: ${decodedBytes} bytes (${decodedSamples} samples)`);
+          // Use exactly one frame worth of samples
+          const expectedBytes = opusFrameSize * 2;
+          const finalBuffer = decodedBytes >= expectedBytes
+            ? decodedBuffer.slice(0, expectedBytes)
+            : decodedBuffer;
+          
+          // Verify the buffer contains audio
+          const sampleArray = new Int16Array(finalBuffer.buffer, finalBuffer.byteOffset, finalBuffer.length / 2);
+          const hasAudio = sampleArray.some(sample => Math.abs(sample) > 100); // Check for non-silence
+          console.log(`Using: ${opusFrameSize} samples (${finalBuffer.length} bytes), hasAudio: ${hasAudio}, Base64: ${finalBuffer.toString('base64').length} chars`);
+          
+          // Wrap decoded audio chunk into input_audio_buffer.append event
+          // finalBuffer is now guaranteed to be in little-endian PCM16 format
+          const base64 = finalBuffer.toString('base64');
+          if (base64.length === 0) {
+            console.warn('Empty base64, skipping');
+            continue;
+          }
+          const evt = {
+            type: 'input_audio_buffer.append',
+            audio: base64,
+          };
+          const msg = JSON.stringify(evt);
+          if (openai.readyState === WebSocket.OPEN) {
+            safeSend(openai, msg);
+            console.log(`Sent ${opusFrameSize} samples to OpenAI`);
+          } else {
+            pendingClientMessages.push(msg);
+          }
+        }
+      } catch (error) {
+        console.error('Opus encode/decode error:', error);
+        // Fallback: send original buffer if opus processing fails
+        const base64 = buf.toString('base64');
+        if (base64.length === 0) return;
+        const evt = {
+          type: 'input_audio_buffer.append',
+          audio: base64,
+        };
+        const msg = JSON.stringify(evt);
+        if (openai.readyState === WebSocket.OPEN) safeSend(openai, msg);
+        else pendingClientMessages.push(msg);
+      }
       return;
     }
 
@@ -158,11 +256,58 @@ clientWss.on('connection', (client) => {
           // Ensure 16-bit alignment
           const buf = Buffer.from(chunk);
           if (buf.length % 2 !== 0) return;
-          const base64 = buf.toString('base64');
-          if (!base64) return;
-          const evt = { type: 'input_audio_buffer.append', audio: base64 };
-          safeSend(openai, JSON.stringify(evt));
-          console.log(`Speaker audio chunk: ${chunk.length} bytes`);
+          
+          try {
+            // Convert buffer to Int16Array
+            const samples = buf.length / 2;
+            const pcm16Data = new Int16Array(samples);
+            for (let i = 0; i < samples; i++) {
+              pcm16Data[i] = buf.readInt16LE(i * 2);
+            }
+            
+            // Append to speaker audio buffer
+            const newBuffer = new Int16Array(speakerAudioBuffer.length + samples);
+            newBuffer.set(speakerAudioBuffer);
+            newBuffer.set(pcm16Data, speakerAudioBuffer.length);
+            speakerAudioBuffer = newBuffer;
+            
+            // Process complete opus frames
+            while (speakerAudioBuffer.length >= opusFrameSize) {
+              // Extract one frame
+              const frame = speakerAudioBuffer.slice(0, opusFrameSize);
+              speakerAudioBuffer = speakerAudioBuffer.slice(opusFrameSize);
+              
+              // Encode with opus (@discordjs/opus expects PCM16 Buffer)
+              const framePcmBuffer2 = Buffer.allocUnsafe(opusFrameSize * 2);
+              for (let i = 0; i < opusFrameSize; i++) {
+                framePcmBuffer2.writeInt16LE(frame[i], i * 2);
+              }
+              const encoded = encoder.encode(framePcmBuffer2);
+              
+              // Decode back to PCM16
+              const decodedBuffer2 = decoder.decode(encoded);
+              const expectedBytes2 = opusFrameSize * 2;
+              const finalBuffer2 = decodedBuffer2.length >= expectedBytes2
+                ? decodedBuffer2.slice(0, expectedBytes2)
+                : decodedBuffer2;
+              
+              // Wrap decoded audio chunk into input_audio_buffer.append event
+              // finalBuffer is now guaranteed to be in little-endian PCM16 format
+              const base64 = finalBuffer2.toString('base64');
+              if (!base64) continue;
+              const evt = { type: 'input_audio_buffer.append', audio: base64 };
+              safeSend(openai, JSON.stringify(evt));
+            }
+            console.log(`Speaker audio chunk: ${chunk.length} bytes -> opus processed`);
+          } catch (error) {
+            console.error('Opus encode/decode error (speaker):', error);
+            // Fallback: send original buffer if opus processing fails
+            const base64 = buf.toString('base64');
+            if (!base64) return;
+            const evt = { type: 'input_audio_buffer.append', audio: base64 };
+            safeSend(openai, JSON.stringify(evt));
+            console.log(`Speaker audio chunk: ${chunk.length} bytes (fallback)`);
+          }
         });
         speakerProc.stderr.on('data', (data) => {
           console.log('FFmpeg stderr:', data.toString());
@@ -197,6 +342,17 @@ clientWss.on('connection', (client) => {
 
   // Pipe OpenAI -> client (transcription events)
   openai.on('message', (data) => {
+    // Log OpenAI responses for debugging
+    try {
+      const parsed = typeof data === 'string' ? JSON.parse(data) : JSON.parse(data.toString());
+      if (parsed.type === 'error') {
+        console.error('OpenAI error:', parsed);
+      } else {
+        console.log('OpenAI event:', parsed.type);
+      }
+    } catch (e) {
+      // Binary or non-JSON data
+    }
     // We forward server events to client UI
     safeSend(client, data);
   });
@@ -206,6 +362,10 @@ clientWss.on('connection', (client) => {
       try { speakerProc.kill('SIGTERM'); } catch {}
       speakerProc = null;
     }
+    try {
+      if (encoder) encoder.delete();
+      if (decoder) decoder.delete();
+    } catch {}
     try { openai.close(); } catch {}
     try { client.close(); } catch {}
   };
